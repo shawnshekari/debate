@@ -1,0 +1,17 @@
+{
+  "gemma": {
+    "name": "Gemma",
+    "template": "gemma",
+    "stop_tokens": ["<end_of_turn>", "<start_of_turn>"]
+  },
+  "qwen": {
+    "name": "Qwen",
+    "template": "qwen",
+    "stop_tokens": ["<|im_end|>"]
+  },
+  "mistral": {
+    "name": "Mistral",
+    "template": "mistral",
+    "stop_tokens": ["</s>", "[/INST]"]
+  }
+}

@@ -16,6 +16,7 @@ from typing import List, Dict
 
 # --- Configuration ---
 CONSENSUS_PHRASE = "[DEBATE_COMPLETE]"
+USER_INPUT_PHRASE = "[USER_INPUT]"
 # Set a default minimum number of rounds (one turn per model) before consensus is allowed
 DEFAULT_MIN_ROUNDS = 3 # This means at least 6 total turns must happen
 
@@ -28,18 +29,117 @@ class Bcolors:
     ENDC = '\033[0m'
 
 class LLMConsensus:
-    def __init__(self, rounds: int, topic: str, min_rounds: int):
-        self.models = {
-            "model1": {"name": "Model 1 (Gemma)", "url": "http://localhost:5300/completion", "template": "gemma", "stop_tokens": ["<end_of_turn>", "<start_of_turn>"], "color": Bcolors.MODEL1},
-            "model2": {"name": "Model 2 (Qwen)", "url": "http://192.168.2.55:5300/completion", "template": "qwen", "stop_tokens": ["<|im_end|>"], "color": Bcolors.MODEL2}
-        }
+    def __init__(self, rounds: int, topic: str, min_rounds: int, model_urls: List[str], model_types: List[str | None]):
+        self.model_templates = self.load_model_templates()
+        self.models = {}
         self.max_rounds = rounds
         self.initial_topic = topic
         self.min_rounds_before_consensus = min_rounds
         self.conversation_history: List[Dict] = []
         self.session = requests.Session()
         self.markdown_filename = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
-        self.end_proposed_by: str = None
+        self.end_proposed_by: str | None = None
+
+        self.initialize_models(model_urls, model_types)
+
+    def load_model_templates(self) -> Dict:
+        try:
+            with open("model_templates.json", 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print("Error: `model_templates.json` not found.")
+            exit(1)
+        except json.JSONDecodeError:
+            print("Error: Could not decode `model_templates.json`.")
+            exit(1)
+
+    def initialize_models(self, model_urls: List[str], model_types: List[str | None]):
+        model_colors = [Bcolors.MODEL1, Bcolors.MODEL2]
+        print(f"{Bcolors.HEADER}{'='*20} Model Initialization {'='*20}{Bcolors.ENDC}")
+        for i, url in enumerate(model_urls):
+            model_key = f"model{i+1}"
+            model_type = model_types[i]
+
+            if model_type:
+                print(f"\n{Bcolors.BOLD}Manually setting model type for: {url}{Bcolors.ENDC}")
+                print(f"  -> Type specified: '{model_type}'")
+            else:
+                print(f"\n{Bcolors.BOLD}Attempting to auto-identify model at: {url}{Bcolors.ENDC}")
+                model_type = self.identify_model(url)
+            
+            template_name = "default"
+            if model_type and model_type in self.model_templates:
+                template = self.model_templates[model_type]
+                template_name = template.get('name', model_type)
+                self.models[model_key] = {
+                    "name": f"Model {i+1} ({template_name})",
+                    "url": url,
+                    "template": template["template"],
+                    "stop_tokens": template["stop_tokens"],
+                    "color": model_colors[i % len(model_colors)]
+                }
+                print(f"  -> {Bcolors.MODEL1}Using template: '{template['template']}'{Bcolors.ENDC}")
+            else:
+                self.models[model_key] = {
+                    "name": f"Model {i+1} (Unknown)",
+                    "url": url,
+                    "template": "default",
+                    "stop_tokens": [],
+                    "color": model_colors[i % len(model_colors)]
+                }
+                if model_type:
+                    print(f"  -> {Bcolors.MODEL2}Error: Manual type '{model_type}' not found in model_templates.json.{Bcolors.ENDC}")
+                else:
+                    print(f"  -> {Bcolors.MODEL2}Could not identify model type.{Bcolors.ENDC}")
+                print(f"  -> {Bcolors.MODEL2}Using template: 'default'{Bcolors.ENDC}")
+        print(f"{Bcolors.HEADER}{'='*58}{Bcolors.ENDC}\n")
+
+    def identify_model(self, url: str) -> str | None:
+        """
+        Identifies the model type by first checking server properties and then
+        falling back to a prompt-based guess.
+        """
+        try:
+            # Attempt 1: Check for llama.cpp server properties endpoint
+            base_url = '/'.join(url.split('/')[:-1])
+            props_url = f"{base_url}/"
+            try:
+                response = self.session.get(props_url, timeout=5)
+                if response.status_code == 200 and 'model_path' in response.text:
+                    content = response.json()
+                    model_path = content.get("model_path", "").lower()
+                    print(f"  -> Server properties found. Model path: {model_path}")
+                    if "gemma" in model_path:
+                        return "gemma"
+                    if "qwen" in model_path or "tongyi" in model_path:
+                        return "qwen"
+                    if "mistral" in model_path:
+                        return "mistral"
+            except (requests.exceptions.RequestException, json.JSONDecodeError):
+                print("  -> Server properties endpoint not found or invalid.")
+                pass
+
+            # Attempt 2: Fallback to prompt-based identification
+            print("  -> Falling back to prompt-based identification...")
+            test_prompt = "please identify your model architecture and type"
+            data = {"prompt": test_prompt, "temperature": 0.1, "n_predict": 128}
+            headers = {"Content-Type": "application/json"}
+            response = self.session.post(url, data=json.dumps(data), headers=headers, timeout=30)
+            response.raise_for_status()
+            content = response.json().get('content', '').lower()
+            print(f"  -> Response from prompt: \"{content}\"")
+
+            if "gemma" in content:
+                return "gemma"
+            if "qwen" in content or "tongyi" in content:
+                return "qwen"
+            if "mistral" in content:
+                return "mistral"
+
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"  -> Error connecting to model at {url}: {e}")
+            return None
 
     def format_prompt(self, target_model_key: str, is_summary_prompt: bool = False) -> str:
         """Builds a prompt using the correct chat template with refined instructions."""
@@ -53,6 +153,7 @@ class LLMConsensus:
             "- Directly address the other model's points in your rebuttals.\n"
             "- The debate should continue for several rounds to explore the topic fully.\n"
             f"- To end the debate, you must propose it. Only do this if all arguments have been exhausted and the conversation is becoming repetitive. Propose ending by including the exact phrase: {CONSENSUS_PHRASE}\n"
+            f"- To ask for the user's input, only if you feel it is needed, include the exact phrase: {USER_INPUT_PHRASE}\n"
             "- IMPORTANT: Do NOT use this phrase just to end your turn. It is a proposal to end the entire debate."
         )
 
@@ -86,10 +187,25 @@ class LLMConsensus:
                 prompt += f"<|im_start|>{entry['role']}\n{entry['content']}<|im_end|>\n"
             prompt += "<|im_start|>assistant\n"
             return prompt
+
+        elif template_style == "mistral":
+            prompt = "<s>"
+            # The first turn should include the system prompt and the first user message
+            if history:
+                first_turn_content = f"{system_instruction}\n\nDEBATE TOPIC: {history[0]['content']}"
+                prompt += f"[INST] {first_turn_content} [/INST]"
+
+                # Subsequent turns alternate between model and user
+                for i, entry in enumerate(history[1:], 1):
+                    if entry.get('is_model_response'):
+                        prompt += f" {entry['content']} </s>"
+                    else:
+                        prompt += f"[INST] {entry['content']} [/INST]"
+            return prompt
             
         return ""
 
-    def send_request(self, model_key: str, prompt: str, stop_override: List = None) -> str:
+    def send_request(self, model_key: str, prompt: str, stop_override: List | None = None) -> str:
         model_config = self.models[model_key]
         try:
             stop_tokens = stop_override if stop_override is not None else model_config["stop_tokens"]
@@ -138,6 +254,19 @@ class LLMConsensus:
 
                 debate_concluded = False
                 clean_response = response.replace(CONSENSUS_PHRASE, "").strip()
+
+                if USER_INPUT_PHRASE in response:
+                    clean_response = clean_response.replace(USER_INPUT_PHRASE, "").strip()
+                    self.print_and_write_response(md_file, turn, model_config, clean_response, exec_time)
+                    self.conversation_history.append({"role": 'assistant', "content": clean_response, "is_model_response": True})
+
+                    print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has requested user input ---{Bcolors.ENDC}")
+                    user_input = input(f"{Bcolors.BOLD}Your response: {Bcolors.ENDC}")
+                    self.conversation_history.append({"role": "user", "content": user_input})
+                    md_file.write(f"**_User has been prompted for input and responded:_**\n\n> {user_input}\n\n---\n\n")
+
+                    current_speaker_key = "model2" if current_speaker_key == "model1" else "model1"
+                    continue
                 
                 # Check if consensus phrase is used AND we are past the minimum number of rounds
                 if CONSENSUS_PHRASE in response and (turn + 1) > (self.min_rounds_before_consensus * 2):
@@ -155,8 +284,7 @@ class LLMConsensus:
                     self.end_proposed_by = None
 
                 self.print_and_write_response(md_file, turn, model_config, clean_response, exec_time)
-                
-                self.conversation_history.append({"role": 'assistant', "content": clean_response, "is_model_response": True})
+                self.conversation_history.append({"role": 'assistant', "content": clean_response, "is_model_response": True, "model_key": current_speaker_key})
                 
                 if debate_concluded:
                     break
@@ -202,7 +330,13 @@ if __name__ == "__main__":
         default=DEFAULT_MIN_ROUNDS,
         help=f"The minimum number of rounds before models can conclude the debate. (Default: {DEFAULT_MIN_ROUNDS})"
     )
+    parser.add_argument("--model1_url", type=str, default="http://localhost:5300/completion", help="URL of the first model's completion endpoint.")
+    parser.add_argument("--model2_url", type=str, default="http://192.168.2.55:5300/completion", help="URL of the second model's completion endpoint.")
+    parser.add_argument("--model1_type", type=str, default=None, help="Manually specify the type of the first model (e.g., 'gemma', 'qwen').")
+    parser.add_argument("--model2_type", type=str, default=None, help="Manually specify the type of the second model (e.g., 'gemma', 'qwen').")
     args = parser.parse_args()
     
-    consensus = LLMConsensus(rounds=args.rounds, topic=args.topic, min_rounds=args.min_rounds)
+    model_urls = [args.model1_url, args.model2_url]
+    model_types = [args.model1_type, args.model2_type]
+    consensus = LLMConsensus(rounds=args.rounds, topic=args.topic, min_rounds=args.min_rounds, model_urls=model_urls, model_types=model_types)
     consensus.run()
