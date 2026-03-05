@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLM Consensus Script - V3.7 - Minimum Rounds & Refined Instructions
+LLM Consensus Script - V4.0 - Enhanced Validation & Error Handling
 
 This version prevents premature endings by enforcing a minimum round count
 before consensus can be proposed and by providing much clearer instructions
@@ -12,39 +12,125 @@ import json
 import time
 import argparse
 import textwrap
-from typing import List, Dict
+import re
+import sys
+import os
+from typing import List, Dict, Optional, Any
+from urllib.parse import urlparse
 
 # --- Configuration ---
 CONSENSUS_PHRASE = "[DEBATE_COMPLETE]"
 USER_INPUT_PHRASE = "[USER_INPUT]"
-# Set a default minimum number of rounds (one turn per model) before consensus is allowed
-DEFAULT_MIN_ROUNDS = 3 # This means at least 6 total turns must happen
+DEFAULT_MIN_ROUNDS = 3
+MAX_TOPIC_LENGTH = 1000
+MAX_USER_INPUT_LENGTH = 5000
+DEFAULT_TIMEOUT_CONNECT = 5
+DEFAULT_TIMEOUT_RESPONSE = 30
+DEFAULT_TIMEOUT_GENERATION = 300
+MAX_ROUNDS = 100
+
 
 class Bcolors:
-    MODEL1 = '\033[94m'
-    MODEL2 = '\033[92m'
-    HEADER = '\033[95m'
-    TITLE = '\033[93m'
-    BOLD = '\033[1m'
-    ENDC = '\033[0m'
+    MODEL1 = "\033[94m"
+    MODEL2 = "\033[92m"
+    HEADER = "\033[95m"
+    TITLE = "\033[93m"
+    BOLD = "\033[1m"
+    ENDC = "\033[0m"
+
 
 class LLMConsensus:
-    def __init__(self, rounds: int, topic: str, min_rounds: int, model_urls: List[str], model_types: List[str | None]):
+    def __init__(
+        self,
+        rounds: int,
+        topic: str,
+        min_rounds: int,
+        model_urls: List[str],
+        model_types: List[Optional[str]],
+        config_file: Optional[str] = None,
+    ):
         self.model_templates = self.load_model_templates()
         self.models = {}
         self.max_rounds = rounds
         self.initial_topic = topic
         self.min_rounds_before_consensus = min_rounds
-        self.conversation_history: List[Dict] = []
+        self.conversation_history: List[Dict[str, Any]] = []
         self.session = requests.Session()
         self.markdown_filename = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
-        self.end_proposed_by: str | None = None
+        self.end_proposed_by: Optional[str] = None
 
+        if config_file:
+            self.load_config(config_file)
+
+        self.validate_inputs(rounds, topic, min_rounds, model_urls, model_types)
         self.initialize_models(model_urls, model_types)
+
+    def load_config(self, config_file: str) -> Dict[str, Any]:
+        """Load configuration from JSON file."""
+        if not os.path.exists(config_file):
+            print(
+                f"{Bcolors.MODEL2}Warning: Config file '{config_file}' not found. Using defaults.{Bcolors.ENDC}"
+            )
+            return {}
+
+        try:
+            with open(config_file, "r") as f:
+                config = json.load(f)
+            print(
+                f"{Bcolors.HEADER}Loaded configuration from {config_file}{Bcolors.ENDC}"
+            )
+            return config
+        except json.JSONDecodeError as e:
+            print(
+                f"{Bcolors.MODEL2}Error: Invalid JSON in config file: {e}{Bcolors.ENDC}"
+            )
+            return {}
+        except Exception as e:
+            print(f"{Bcolors.MODEL2}Error loading config file: {e}{Bcolors.ENDC}")
+            return {}
+
+    def validate_inputs(
+        self,
+        rounds: int,
+        topic: str,
+        min_rounds: int,
+        model_urls: List[str],
+        model_types: List[Optional[str]],
+    ) -> None:
+        """Validate all input parameters before proceeding."""
+        if rounds <= 0:
+            raise ValueError(f"Rounds must be positive, got {rounds}")
+        if rounds > MAX_ROUNDS:
+            raise ValueError(f"Rounds exceeds maximum of {MAX_ROUNDS}, got {rounds}")
+        if min_rounds <= 0:
+            raise ValueError(f"Min rounds must be positive, got {min_rounds}")
+        if min_rounds > rounds:
+            raise ValueError(
+                f"Min rounds ({min_rounds}) cannot exceed max rounds ({rounds})"
+            )
+        if not topic or not topic.strip():
+            raise ValueError("Topic cannot be empty")
+        if len(topic) > MAX_TOPIC_LENGTH:
+            raise ValueError(f"Topic exceeds maximum length of {MAX_TOPIC_LENGTH}")
+        if len(model_urls) != 2:
+            raise ValueError(f"Exactly 2 model URLs required, got {len(model_urls)}")
+        if len(model_types) != 2:
+            raise ValueError(f"Exactly 2 model types required, got {len(model_types)}")
+        for i, url in enumerate(model_urls):
+            if not self.validate_url(url):
+                raise ValueError(f"Invalid URL for model {i + 1}: {url}")
+
+    def validate_url(self, url: str) -> bool:
+        """Validate URL format."""
+        try:
+            result = urlparse(url)
+            return all([result.scheme in ("http", "https"), result.netloc])
+        except Exception:
+            return False
 
     def load_model_templates(self) -> Dict:
         try:
-            with open("model_templates.json", 'r') as f:
+            with open("model_templates.json", "r") as f:
                 return json.load(f)
         except FileNotFoundError:
             print("Error: `model_templates.json` not found.")
@@ -55,44 +141,56 @@ class LLMConsensus:
 
     def initialize_models(self, model_urls: List[str], model_types: List[str | None]):
         model_colors = [Bcolors.MODEL1, Bcolors.MODEL2]
-        print(f"{Bcolors.HEADER}{'='*20} Model Initialization {'='*20}{Bcolors.ENDC}")
+        print(
+            f"{Bcolors.HEADER}{'=' * 20} Model Initialization {'=' * 20}{Bcolors.ENDC}"
+        )
         for i, url in enumerate(model_urls):
-            model_key = f"model{i+1}"
+            model_key = f"model{i + 1}"
             model_type = model_types[i]
 
             if model_type:
-                print(f"\n{Bcolors.BOLD}Manually setting model type for: {url}{Bcolors.ENDC}")
+                print(
+                    f"\n{Bcolors.BOLD}Manually setting model type for: {url}{Bcolors.ENDC}"
+                )
                 print(f"  -> Type specified: '{model_type}'")
             else:
-                print(f"\n{Bcolors.BOLD}Attempting to auto-identify model at: {url}{Bcolors.ENDC}")
+                print(
+                    f"\n{Bcolors.BOLD}Attempting to auto-identify model at: {url}{Bcolors.ENDC}"
+                )
                 model_type = self.identify_model(url)
-            
+
             template_name = "default"
             if model_type and model_type in self.model_templates:
                 template = self.model_templates[model_type]
-                template_name = template.get('name', model_type)
+                template_name = template.get("name", model_type)
                 self.models[model_key] = {
-                    "name": f"Model {i+1} ({template_name})",
+                    "name": f"Model {i + 1} ({template_name})",
                     "url": url,
                     "template": template["template"],
                     "stop_tokens": template["stop_tokens"],
-                    "color": model_colors[i % len(model_colors)]
+                    "color": model_colors[i % len(model_colors)],
                 }
-                print(f"  -> {Bcolors.MODEL1}Using template: '{template['template']}'{Bcolors.ENDC}")
+                print(
+                    f"  -> {Bcolors.MODEL1}Using template: '{template['template']}'{Bcolors.ENDC}"
+                )
             else:
                 self.models[model_key] = {
-                    "name": f"Model {i+1} (Unknown)",
+                    "name": f"Model {i + 1} (Unknown)",
                     "url": url,
                     "template": "default",
                     "stop_tokens": [],
-                    "color": model_colors[i % len(model_colors)]
+                    "color": model_colors[i % len(model_colors)],
                 }
                 if model_type:
-                    print(f"  -> {Bcolors.MODEL2}Error: Manual type '{model_type}' not found in model_templates.json.{Bcolors.ENDC}")
+                    print(
+                        f"  -> {Bcolors.MODEL2}Error: Manual type '{model_type}' not found in model_templates.json.{Bcolors.ENDC}"
+                    )
                 else:
-                    print(f"  -> {Bcolors.MODEL2}Could not identify model type.{Bcolors.ENDC}")
+                    print(
+                        f"  -> {Bcolors.MODEL2}Could not identify model type.{Bcolors.ENDC}"
+                    )
                 print(f"  -> {Bcolors.MODEL2}Using template: 'default'{Bcolors.ENDC}")
-        print(f"{Bcolors.HEADER}{'='*58}{Bcolors.ENDC}\n")
+        print(f"{Bcolors.HEADER}{'=' * 58}{Bcolors.ENDC}\n")
 
     def identify_model(self, url: str) -> str | None:
         """
@@ -101,16 +199,18 @@ class LLMConsensus:
         """
         try:
             # Attempt 1: Check for llama.cpp server properties endpoint
-            base_url = '/'.join(url.split('/')[:-1])
+            base_url = "/".join(url.split("/")[:-1])
             props_url = f"{base_url}/"
             try:
                 response = self.session.get(props_url, timeout=5)
-                if response.status_code == 200 and 'model_path' in response.text:
+                if response.status_code == 200 and "model_path" in response.text:
                     content = response.json()
                     model_path = content.get("model_path", "").lower()
                     print(f"  -> Server properties found. Model path: {model_path}")
                     if "gemma" in model_path:
                         return "gemma"
+                    if "gpt-oss" in model_path:
+                        return "gpt-oss"
                     if "qwen" in model_path or "tongyi" in model_path:
                         return "qwen"
                     if "mistral" in model_path:
@@ -124,10 +224,12 @@ class LLMConsensus:
             test_prompt = "please identify your model architecture and type"
             data = {"prompt": test_prompt, "temperature": 0.1, "n_predict": 128}
             headers = {"Content-Type": "application/json"}
-            response = self.session.post(url, data=json.dumps(data), headers=headers, timeout=30)
+            response = self.session.post(
+                url, data=json.dumps(data), headers=headers, timeout=30
+            )
             response.raise_for_status()
-            content = response.json().get('content', '').lower()
-            print(f"  -> Response from prompt: \"{content}\"")
+            content = response.json().get("content", "").lower()
+            print(f'  -> Response from prompt: "{content}"')
 
             if "gemma" in content:
                 return "gemma"
@@ -141,202 +243,418 @@ class LLMConsensus:
             print(f"  -> Error connecting to model at {url}: {e}")
             return None
 
-    def format_prompt(self, target_model_key: str, is_summary_prompt: bool = False) -> str:
+    def format_prompt(
+        self, target_model_key: str, is_summary_prompt: bool = False
+    ) -> str:
         """Builds a prompt using the correct chat template with refined instructions."""
         template_style = self.models[target_model_key]["template"]
         history = self.conversation_history.copy()
 
-        # --- REFINED INSTRUCTIONS ---
+        # --- DEBATE INSTRUCTIONS ---
         system_instruction = (
-            "You are an expert AI debater. Your goal is to engage in a thorough and critical discussion. A few rules:\n"
-            "- Justify your claims with evidence and logic.\n"
-            "- Directly address the other model's points in your rebuttals.\n"
-            "- The debate should continue for several rounds to explore the topic fully.\n"
+            f"You are an expert AI debater. Your goal is to engage in a thorough and critical discussion. The debate is between Model 1, and Model 2. A few rules:\n"
+            f"- There is no moderator, just the two models debating the topic.\n"
             f"- To end the debate, you must propose it. Only do this if all arguments have been exhausted and the conversation is becoming repetitive. Propose ending by including the exact phrase: {CONSENSUS_PHRASE}\n"
-            f"- To ask for the user's input, only if you feel it is needed, include the exact phrase: {USER_INPUT_PHRASE}\n"
-            "- IMPORTANT: Do NOT use this phrase just to end your turn. It is a proposal to end the entire debate."
+            f"- IMPORTANT: Do NOT use this phrase just to end your turn. It is a proposal to end the entire debate. Do you really have no other topics to introduce?\n"
+            f"- When referring to other models, always use 'Model 1' or 'Model 2' (e.g., 'Model 1 argues...', 'Model 2 counters...')."
         )
 
         if is_summary_prompt:
-            summary_instruction = "The following is a complete transcript of a debate. Your task is to act as a neutral moderator and write a final, conclusive summary including key arguments, conclusions, and next steps."
+            summary_instruction = "The following is a complete transcript of a debate. Write a concise summary highlighting the main arguments and conclusions from both models, using clear paragraphs with line breaks."
             history.append({"role": "user", "content": summary_instruction})
-        
+
         elif self.end_proposed_by:
-            proposer_name = self.models[self.end_proposed_by]['name']
+            proposer_name = self.models[self.end_proposed_by]["name"]
             confirmation_instruction = (
-                f"{proposer_name} has proposed concluding the debate. Please provide your final thoughts. If you agree that the "
-                "discussion is complete and no new points can be made, include the phrase [DEBATE_COMPLETE] in your response. "
-                "Otherwise, continue the debate by presenting a new argument."
+                f"{proposer_name} has proposed concluding the debate. To agree, your response MUST include the phrase `[DEBATE_COMPLETE]`. "
+                "You can also add a brief concluding statement. If you wish to continue, present a new argument without the phrase."
             )
             history.append({"role": "user", "content": confirmation_instruction})
 
         if template_style == "gemma":
             prompt = ""
             if history:
-                first_turn_content = f"{system_instruction}\n\nDEBATE TOPIC: {history[0]['content']}"
-                prompt += f"<start_of_turn>user\n{first_turn_content}<end_of_turn>\n"
+                first_turn_content = (
+                    f"{system_instruction}\n\nDEBATE TOPIC: {history[0]['content']}"
+                )
+                prompt += (
+                    f"<start_of_turn>user\nUser: {first_turn_content}<end_of_turn>\n"
+                )
                 for i, entry in enumerate(history[1:], 1):
-                    role = "model" if entry.get('is_model_response') else "user"
-                    prompt += f"<start_of_turn>{role}\n{entry['content']}<end_of_turn>\n"
+                    if entry.get("is_model_response", False):
+                        model_key = entry.get("model_key")
+                        model_name = self.models[model_key]["name"]
+                        prompt += f"<start_of_turn>model\n{model_name}: {entry['content']}<end_of_turn>\n"
+                    else:
+                        prompt += f"<start_of_turn>user\nUser: {entry['content']}<end_of_turn>\n"
             prompt += "<start_of_turn>model\n"
             return prompt
-            
-        elif template_style == "qwen":
+
+        elif template_style == "qwen" or template_style == "gpt-oss":
             prompt = f"<|im_start|>system\n{system_instruction}<|im_end|>\n"
             for entry in history:
-                prompt += f"<|im_start|>{entry['role']}\n{entry['content']}<|im_end|>\n"
+                if entry.get("is_model_response"):
+                    model_key = entry.get("model_key")
+                    model_name = self.models[model_key]["name"]
+                    prompt += (
+                        f"<|im_start|>{model_name}\n{entry['content']}<|im_end|>\n"
+                    )
+                else:
+                    prompt += f"<|im_start|>user\nUser: {entry['content']}<|im_end|>\n"
             prompt += "<|im_start|>assistant\n"
             return prompt
 
         elif template_style == "mistral":
             prompt = "<s>"
-            # The first turn should include the system prompt and the first user message
             if history:
-                first_turn_content = f"{system_instruction}\n\nDEBATE TOPIC: {history[0]['content']}"
-                prompt += f"[INST] {first_turn_content} [/INST]"
+                first_turn_content = (
+                    f"{system_instruction}\n\nDEBATE TOPIC: {history[0]['content']}"
+                )
+                prompt += f"[INST] User: {first_turn_content} [/INST]"
 
-                # Subsequent turns alternate between model and user
                 for i, entry in enumerate(history[1:], 1):
-                    if entry.get('is_model_response'):
-                        prompt += f" {entry['content']} </s>"
+                    if entry.get("is_model_response", False):
+                        model_key = entry.get("model_key")
+                        model_name = self.models[model_key]["name"]
+                        prompt += f" {model_name}: {entry['content']} </s>"
                     else:
-                        prompt += f"[INST] {entry['content']} [/INST]"
+                        prompt += f"[INST] User: {entry['content']} [/INST]"
             return prompt
-            
+
         return ""
 
-    def send_request(self, model_key: str, prompt: str, stop_override: List | None = None) -> str:
+    def send_request(
+        self,
+        model_key: str,
+        prompt: str,
+        stop_override: Optional[List[str]] = None,
+        timeout: int = DEFAULT_TIMEOUT_GENERATION,
+    ) -> str:
+        """Send request to model with improved error handling and retry logic."""
         model_config = self.models[model_key]
-        try:
-            stop_tokens = stop_override if stop_override is not None else model_config["stop_tokens"]
-            data = {"prompt": prompt, "temperature": 0.7, "n_predict": 2048, "stop": stop_tokens}
-            headers = {"Content-Type": "application/json"}
-            response = self.session.post(model_config["url"], data=json.dumps(data), headers=headers, timeout=300)
-            response.raise_for_status()
-            result = response.json()
-            content = result.get('content', "Error: 'content' key not found.").strip()
-            return content
-        except requests.exceptions.RequestException as e:
-            return f"Error: Could not connect to the model."
+        max_retries = 3
+        retry_delay = 2
 
-    def print_and_write_response(self, md_file, turn: int, model_config: Dict, response: str, exec_time: float):
+        for attempt in range(max_retries):
+            response = None
+            try:
+                stop_tokens = (
+                    stop_override
+                    if stop_override is not None
+                    else model_config["stop_tokens"]
+                )
+                data = {
+                    "prompt": prompt,
+                    "temperature": 0.7,
+                    "n_predict": 2048,
+                    "stop": stop_tokens,
+                }
+                headers = {"Content-Type": "application/json"}
+                response = self.session.post(
+                    model_config["url"],
+                    data=json.dumps(data),
+                    headers=headers,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                result = response.json()
+                content = result.get("content", "").strip()
+                if not content:
+                    raise ValueError("Empty response from model")
+                return content
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    print(
+                        f"{Bcolors.MODEL2}Timeout for {model_key}, retrying in {retry_delay}s...{Bcolors.ENDC}"
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    print(
+                        f"{Bcolors.MODEL2}Timeout after {max_retries} attempts for {model_key}{Bcolors.ENDC}"
+                    )
+                    return f"Error: Request timeout for {model_config['name']}"
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries - 1:
+                    print(
+                        f"{Bcolors.MODEL2}Connection error for {model_key}, retrying in {retry_delay}s...{Bcolors.ENDC}"
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    print(
+                        f"{Bcolors.MODEL2}Connection failed after {max_retries} attempts for {model_key}{Bcolors.ENDC}"
+                    )
+                    return f"Error: Could not connect to {model_config['name']}"
+            except requests.exceptions.HTTPError as e:
+                status_code = (
+                    response.status_code if response is not None else "unknown"
+                )
+                return f"Error: HTTP {status_code} for {model_config['name']}: {str(e)}"
+            except json.JSONDecodeError:
+                return f"Error: Invalid JSON response from {model_config['name']}"
+            except ValueError as e:
+                return f"Error: {str(e)}"
+            except Exception as e:
+                return f"Error: Unexpected error with {model_config['name']}: {str(e)}"
+
+        return f"Error: Failed to get response from {model_config['name']}"
+
+    def print_and_write_response(
+        self, md_file, turn: int, model_config: Dict, response: str, exec_time: float
+    ):
         """Helper to print to shell and write to markdown file."""
         # Print to shell
         header_text = f" Turn {turn + 1}: {model_config['name']}'s Response "
-        print(f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 10}{header_text}{'=' * (90 - len(header_text))}{Bcolors.ENDC}")
-        print(f"{model_config['color']}{textwrap.fill(response, width=100)}{Bcolors.ENDC}")
-        print(f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 90} [Response Time: {exec_time:.2f}s]{Bcolors.ENDC}\n")
+        print(
+            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 10}{header_text}{'=' * (90 - len(header_text))}{Bcolors.ENDC}"
+        )
+        print(
+            f"{model_config['color']}{textwrap.fill(response, width=100)}{Bcolors.ENDC}"
+        )
+        print(
+            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 90} [Response Time: {exec_time:.2f}s]{Bcolors.ENDC}\n"
+        )
         # Write to file
         md_file.write(f"## Turn {turn + 1}: {model_config['name']}\n\n")
-        for line in response.split('\n'):
+        for line in response.split("\n"):
             md_file.write(f"> {line}\n")
         md_file.write(f"\n_Response Time: {exec_time:.2f}s_\n\n---\n\n")
 
     def conduct_discussion(self) -> None:
         """Conducts a turn-by-turn discussion with refined consensus logic."""
-        print(f"{Bcolors.TITLE}{Bcolors.BOLD}{'='*60}\n      STARTING LLM CONSENSUS DISCUSSION (V3.7 - Refined Consensus)\n{'='*60}{Bcolors.ENDC}")
-        print(f"{Bcolors.TITLE}Saving transcript to: {self.markdown_filename}{Bcolors.ENDC}")
-        print(f"{Bcolors.HEADER}DEBATE TOPIC:{Bcolors.ENDC} \"{self.initial_topic}\"")
+        print(
+            f"{Bcolors.TITLE}{Bcolors.BOLD}{'=' * 60}\n      STARTING LLM CONSENSUS DISCUSSION (V3.7 - Refined Consensus)\n{'=' * 60}{Bcolors.ENDC}"
+        )
+        print(
+            f"{Bcolors.TITLE}Saving transcript to: {self.markdown_filename}{Bcolors.ENDC}"
+        )
+        print(f'{Bcolors.HEADER}DEBATE TOPIC:{Bcolors.ENDC} "{self.initial_topic}"')
 
-        with open(self.markdown_filename, 'w', encoding='utf-8') as md_file:
-            md_file.write(f"# LLM Debate Transcript\n\n**Topic:** {self.initial_topic}\n\n---\n\n")
+        with open(self.markdown_filename, "w", encoding="utf-8") as md_file:
+            md_file.write(
+                f"# LLM Debate Transcript\n\n**Topic:** {self.initial_topic}\n\n---\n\n"
+            )
 
-            self.conversation_history.append({"role": "user", "content": self.initial_topic})
+            self.conversation_history.append(
+                {"role": "user", "content": self.initial_topic}
+            )
             current_speaker_key = "model1"
-            
+
             for turn in range(self.max_rounds * 2):
                 model_config = self.models[current_speaker_key]
                 prompt = self.format_prompt(current_speaker_key)
-                
+
                 start_time = time.time()
                 response = self.send_request(current_speaker_key, prompt)
                 exec_time = time.time() - start_time
 
                 debate_concluded = False
+
+                # The raw response is added to history for accurate context
+                self.conversation_history.append(
+                    {
+                        "role": "assistant",
+                        "content": response,
+                        "is_model_response": True,
+                        "model_key": current_speaker_key,
+                    }
+                )
+
                 clean_response = response.replace(CONSENSUS_PHRASE, "").strip()
+                if not clean_response and CONSENSUS_PHRASE in response:
+                    clean_response = "(Agrees to conclude)"
 
                 if USER_INPUT_PHRASE in response:
-                    clean_response = clean_response.replace(USER_INPUT_PHRASE, "").strip()
-                    self.print_and_write_response(md_file, turn, model_config, clean_response, exec_time)
-                    self.conversation_history.append({"role": 'assistant', "content": clean_response, "is_model_response": True})
+                    self.print_and_write_response(
+                        md_file, turn, model_config, clean_response, exec_time
+                    )
 
-                    print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has requested user input ---{Bcolors.ENDC}")
+                    print(
+                        f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has requested user input ---{Bcolors.ENDC}"
+                    )
                     user_input = input(f"{Bcolors.BOLD}Your response: {Bcolors.ENDC}")
-                    self.conversation_history.append({"role": "user", "content": user_input})
-                    md_file.write(f"**_User has been prompted for input and responded:_**\n\n> {user_input}\n\n---\n\n")
+                    self.conversation_history.append(
+                        {"role": "user", "content": user_input}
+                    )
+                    md_file.write(
+                        f"**_User has been prompted for input and responded:_**\n\n> {user_input}\n\n---\n\n"
+                    )
 
-                    current_speaker_key = "model2" if current_speaker_key == "model1" else "model1"
+                    current_speaker_key = (
+                        "model2" if current_speaker_key == "model1" else "model1"
+                    )
                     continue
-                
+
                 # Check if consensus phrase is used AND we are past the minimum number of rounds
-                if CONSENSUS_PHRASE in response and (turn + 1) > (self.min_rounds_before_consensus * 2):
+                if (turn + 1) > (
+                    self.min_rounds_before_consensus * 2
+                ) and CONSENSUS_PHRASE in response:
                     if not self.end_proposed_by:
                         self.end_proposed_by = current_speaker_key
-                        print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has proposed concluding the debate. Awaiting confirmation... ---{Bcolors.ENDC}")
-                        md_file.write(f"**__{model_config['name']} has proposed concluding the debate.__**\n\n")
-                    else:
-                        print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}")
-                        md_file.write(f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n")
+                        print(
+                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has proposed concluding the debate. Awaiting confirmation... ---{Bcolors.ENDC}"
+                        )
+                        md_file.write(
+                            f"**__{model_config['name']} has proposed concluding the debate.__**\n\n"
+                        )
+                    else:  # Consensus has been confirmed by the other model
+                        print(
+                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}"
+                        )
+                        md_file.write(
+                            f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n"
+                        )
                         debate_concluded = True
-                elif self.end_proposed_by:
-                    print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} continues the debate, rejecting the proposal to end. ---{Bcolors.ENDC}")
-                    md_file.write(f"**__{model_config['name']} continues the debate.__**\n\n")
-                    self.end_proposed_by = None
 
-                self.print_and_write_response(md_file, turn, model_config, clean_response, exec_time)
-                self.conversation_history.append({"role": 'assistant', "content": clean_response, "is_model_response": True, "model_key": current_speaker_key})
-                
+                # If a conclusion was proposed but the current model did not agree
+                elif self.end_proposed_by:
+                    response_lower = response.lower()
+                    agreement_keywords = [
+                        "agree",
+                        "conclude",
+                        "fitting end",
+                        "successful debate",
+                        "natural close",
+                    ]
+                    if any(keyword in response_lower for keyword in agreement_keywords):
+                        print(
+                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}"
+                        )
+                        md_file.write(
+                            f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n"
+                        )
+                        debate_concluded = True
+                    else:
+                        print(
+                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} continues the debate, rejecting the proposal to end. ---{Bcolors.ENDC}"
+                        )
+                        md_file.write(
+                            f"**__{model_config['name']} continues the debate.__**\n\n"
+                        )
+                        self.end_proposed_by = None
+
+                self.print_and_write_response(
+                    md_file, turn, model_config, clean_response, exec_time
+                )
+
                 if debate_concluded:
                     break
 
-                current_speaker_key = "model2" if current_speaker_key == "model1" else "model1"
-            
+                current_speaker_key = (
+                    "model2" if current_speaker_key == "model1" else "model1"
+                )
+
             self.generate_final_summary(md_file)
 
     def generate_final_summary(self, md_file):
         """Tasks a model to write a final summary of the debate."""
-        print(f"\n{Bcolors.TITLE}{Bcolors.BOLD}{'='*30} Generating Final Summary {'='*30}{Bcolors.ENDC}")
+        print(
+            f"\n{Bcolors.TITLE}{Bcolors.BOLD}{'=' * 30} Generating Final Summary {'=' * 30}{Bcolors.ENDC}"
+        )
         summarizer_key = "model1"
         summary_prompt = self.format_prompt(summarizer_key, is_summary_prompt=True)
-        summary_response = self.send_request(summarizer_key, summary_prompt, stop_override=[])
-        
-        final_summary_header = f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
+        summary_response = self.send_request(
+            summarizer_key, summary_prompt, stop_override=[]
+        )
+
+        final_summary_header = (
+            f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
+        )
         print(f"{Bcolors.HEADER}{Bcolors.BOLD}{final_summary_header}{Bcolors.ENDC}")
-        print(f"{Bcolors.MODEL1}{textwrap.fill(summary_response, width=100)}{Bcolors.ENDC}")
-        
+        print(
+            f"{Bcolors.MODEL1}{textwrap.fill(summary_response, width=100)}{Bcolors.ENDC}"
+        )
+
         md_file.write("## Final Summary & Conclusion\n\n")
-        md_file.write(f"_This summary was generated by {self.models[summarizer_key]['name']}._\n\n")
+        md_file.write(
+            f"_This summary was generated by {self.models[summarizer_key]['name']}._\n\n"
+        )
         md_file.write(summary_response)
 
     def run(self):
         """Main execution method, fully restored."""
         try:
             self.conduct_discussion()
-            print(f"\n\n{Bcolors.TITLE}{Bcolors.BOLD}--- Process Finished ---{Bcolors.ENDC}")
-            print(f"{Bcolors.TITLE}Full transcript saved to {self.markdown_filename}{Bcolors.ENDC}")
+            print(
+                f"\n\n{Bcolors.TITLE}{Bcolors.BOLD}--- Process Finished ---{Bcolors.ENDC}"
+            )
+            print(
+                f"{Bcolors.TITLE}Full transcript saved to {self.markdown_filename}{Bcolors.ENDC}"
+            )
         except KeyboardInterrupt:
-            print(f"\n\n{Bcolors.TITLE}{Bcolors.BOLD}--- Script interrupted by user ---{Bcolors.ENDC}")
-            print(f"{Bcolors.TITLE}Partial transcript saved to {self.markdown_filename}{Bcolors.ENDC}")
+            print(
+                f"\n\n{Bcolors.TITLE}{Bcolors.BOLD}--- Script interrupted by user ---{Bcolors.ENDC}"
+            )
+            print(
+                f"{Bcolors.TITLE}Partial transcript saved to {self.markdown_filename}{Bcolors.ENDC}"
+            )
         except Exception as e:
             print(f"\n{Bcolors.BOLD}An unexpected error occurred: {e}{Bcolors.ENDC}")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Conduct a debate between two local LLMs with refined consensus and summary features.")
-    parser.add_argument("--rounds", type=int, default=15, help="Maximum number of rounds for the debate.")
-    parser.add_argument("--topic", type=str, default="Let's debate which of us is the 'smarter' AI.", help="The initial topic for the debate.")
+    parser = argparse.ArgumentParser(
+        description="Conduct a debate between two local LLMs with refined consensus and summary features."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON configuration file (optional).",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=15,
+        help="Maximum number of rounds for the debate.",
+    )
+    parser.add_argument(
+        "--topic",
+        type=str,
+        default="Let's debate which of us is the 'smarter' AI.",
+        help="The initial topic for the debate.",
+    )
     parser.add_argument(
         "--min_rounds",
         type=int,
         default=DEFAULT_MIN_ROUNDS,
-        help=f"The minimum number of rounds before models can conclude the debate. (Default: {DEFAULT_MIN_ROUNDS})"
+        help=f"The minimum number of rounds before models can conclude the debate. (Default: {DEFAULT_MIN_ROUNDS})",
     )
-    parser.add_argument("--model1_url", type=str, default="http://localhost:5300/completion", help="URL of the first model's completion endpoint.")
-    parser.add_argument("--model2_url", type=str, default="http://192.168.2.55:5300/completion", help="URL of the second model's completion endpoint.")
-    parser.add_argument("--model1_type", type=str, default=None, help="Manually specify the type of the first model (e.g., 'gemma', 'qwen').")
-    parser.add_argument("--model2_type", type=str, default=None, help="Manually specify the type of the second model (e.g., 'gemma', 'qwen').")
+    parser.add_argument(
+        "--model1_url",
+        type=str,
+        default="http://localhost:5300/completion",
+        help="URL of the first model's completion endpoint.",
+    )
+    parser.add_argument(
+        "--model2_url",
+        type=str,
+        default="http://192.168.2.55:5300/completion",
+        help="URL of the second model's completion endpoint.",
+    )
+    parser.add_argument(
+        "--model1_type",
+        type=str,
+        default=None,
+        help="Manually specify the type of the first model (e.g., 'gemma', 'qwen').",
+    )
+    parser.add_argument(
+        "--model2_type",
+        type=str,
+        default=None,
+        help="Manually specify the type of the second model (e.g., 'gemma', 'qwen').",
+    )
     args = parser.parse_args()
-    
+
     model_urls = [args.model1_url, args.model2_url]
     model_types = [args.model1_type, args.model2_type]
-    consensus = LLMConsensus(rounds=args.rounds, topic=args.topic, min_rounds=args.min_rounds, model_urls=model_urls, model_types=model_types)
+    consensus = LLMConsensus(
+        rounds=args.rounds,
+        topic=args.topic,
+        min_rounds=args.min_rounds,
+        model_urls=model_urls,
+        model_types=model_types,
+        config_file=args.config,
+    )
     consensus.run()

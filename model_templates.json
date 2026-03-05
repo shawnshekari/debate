@@ -9,6 +9,11 @@
     "template": "qwen",
     "stop_tokens": ["<|im_end|>"]
   },
+  "gpt-oss": {
+    "name": "GPT-OSS",
+    "template": "gpt-oss",
+    "stop_tokens": ["<|im_end|>"]
+  },
   "mistral": {
     "name": "Mistral",
     "template": "mistral",

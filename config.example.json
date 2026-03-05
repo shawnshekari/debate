@@ -1,0 +1,9 @@
+{
+  "rounds": 15,
+  "topic": "Artificial intelligence will benefit humanity overall.",
+  "min_rounds": 3,
+  "model1_url": "http://localhost:5300/completion",
+  "model2_url": "http://192.168.2.55:5300/completion",
+  "model1_type": "qwen",
+  "model2_type": "gemma"
+}
