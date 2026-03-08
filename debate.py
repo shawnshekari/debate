@@ -54,7 +54,7 @@ class ConfigData(TypedDict, total=False):
 
 
 # --- Configuration ---
-CONSENSUS_PHRASE = "[DEBATE_COMPLETE]"
+SURRENDER_PHRASE = "[I CONCEED]"
 USER_INPUT_PHRASE = "[USER_INPUT]"
 DEFAULT_MIN_ROUNDS = 3
 MAX_TOPIC_LENGTH = 1000
@@ -145,11 +145,11 @@ class LLMConsensus:
         self.models: Dict[str, ModelConfig] = {}
         self.max_rounds: int = rounds
         self.initial_topic: str = topic
-        self.min_rounds_before_consensus: int = min_rounds
+        self.min_rounds_before_surrender: int = min_rounds
         self.conversation_history: List[Dict[str, Any]] = []
         self.session: requests.Session = requests.Session()
         self.markdown_filename: str = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
-        self.end_proposed_by: Optional[str] = None
+        self.winner: Optional[str] = None
 
         if config_file:
             self.load_config(config_file)
@@ -593,22 +593,23 @@ class LLMConsensus:
         system_instruction = (
             f"You are an expert AI debater. Your goal is to engage in a thorough and critical discussion. The debate is between Model 1, and Model 2. A few rules:\n"
             f"- There is no moderator, just the two models debating the topic.\n"
-            f"- To end the debate, you must propose it. Only do this if all arguments have been exhausted and the conversation is becoming repetitive. Propose ending by including the exact phrase: {CONSENSUS_PHRASE}\n"
-            f"- IMPORTANT: Do NOT use this phrase just to end your turn. It is a proposal to end the entire debate. Do you really have no other topics to introduce?\n"
+            f"- When you run out of arguments or believe your opponent has won, surrender by including the exact phrase: {SURRENDER_PHRASE}\n"
+            f"- IMPORTANT: Only surrender when you truly have no more arguments. The first model to surrender loses, and the other model wins.\n"
+            f"- If you surrender, the debate ends immediately and the winner writes a summary highlighting why they won.\n"
             f"- When referring to other models, always use 'Model 1' or 'Model 2' (e.g., 'Model 1 argues...', 'Model 2 counters...')."
         )
 
         if is_summary_prompt:
-            summary_instruction = "The following is a complete transcript of a debate. Write a concise summary highlighting the main arguments and conclusions from both models, using clear paragraphs with line breaks."
+            if self.winner:
+                winner_name = self.models[self.winner]["name"]
+                summary_instruction = (
+                    f"You are {winner_name}, the winner of this debate. "
+                    f"Write a triumphant summary explaining why you won, highlighting your strongest arguments and pointing out where your opponent's arguments failed. "
+                    f"Be confident but professional. The following is the complete debate transcript:\n\n"
+                )
+            else:
+                summary_instruction = "The following is a complete transcript of a debate. Write a concise summary highlighting the main arguments and conclusions from both models, using clear paragraphs with line breaks."
             history.append({"role": "user", "content": summary_instruction})
-
-        elif self.end_proposed_by:
-            proposer_name = self.models[self.end_proposed_by]["name"]
-            confirmation_instruction = (
-                f"{proposer_name} has proposed concluding the debate. To agree, your response MUST include the phrase `[DEBATE_COMPLETE]`. "
-                "You can also add a brief concluding statement. If you wish to continue, present a new argument without the phrase."
-            )
-            history.append({"role": "user", "content": confirmation_instruction})
 
         if template_style == "gemma":
             prompt = ""
@@ -872,7 +873,7 @@ class LLMConsensus:
             )
 
             self.logger.info(
-                f"Debate starting: max_rounds={self.max_rounds}, min_rounds={self.min_rounds_before_consensus}"
+                f"Debate starting: max_rounds={self.max_rounds}, min_rounds={self.min_rounds_before_surrender}"
             )
 
             for turn in range(self.max_rounds * 2):
@@ -898,9 +899,9 @@ class LLMConsensus:
                     }
                 )
 
-                clean_response = response.replace(CONSENSUS_PHRASE, "").strip()
-                if not clean_response and CONSENSUS_PHRASE in response:
-                    clean_response = "(Agrees to conclude)"
+                clean_response = response.replace("[I CONCEED]", "").strip()
+                if not clean_response and "i conceed" in response.lower():
+                    clean_response = "(Surrenders)"
 
                 if USER_INPUT_PHRASE in response:
                     self.print_and_write_response(
@@ -926,67 +927,22 @@ class LLMConsensus:
                     )
                     continue
 
-                # Check if consensus phrase is used AND we are past the minimum number of rounds
+                # Check if model surrendered (case insensitive)
                 if (turn + 1) > (
-                    self.min_rounds_before_consensus * 2
-                ) and CONSENSUS_PHRASE in response:
-                    if not self.end_proposed_by:
-                        self.end_proposed_by = current_speaker_key
-                        print(
-                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} has proposed concluding the debate. Awaiting confirmation... ---{Bcolors.ENDC}"
-                        )
-                        md_file.write(
-                            f"**__{model_config['name']} has proposed concluding the debate.__**\n\n"
-                        )
-                    elif (
-                        self.end_proposed_by != current_speaker_key
-                        and current_speaker_key == expected_responder
-                    ):
-                        print(
-                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}"
-                        )
-                        md_file.write(
-                            f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n"
-                        )
-                        debate_concluded = True
-                    else:
-                        print(
-                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} reaffirms proposal to conclude. Awaiting confirmation... ---{Bcolors.ENDC}"
-                        )
-                        md_file.write(
-                            f"**__{model_config['name']} reaffirms proposal to conclude.__**\n\n"
-                        )
-
-                # If a conclusion was proposed but the current model did not agree
-                elif (
-                    self.end_proposed_by
-                    and self.end_proposed_by != current_speaker_key
-                    and current_speaker_key == expected_responder
-                ):
-                    response_lower = response.lower()
-                    agreement_keywords = [
-                        "agree",
-                        "conclude",
-                        "fitting end",
-                        "successful debate",
-                        "natural close",
-                    ]
-                    if any(keyword in response_lower for keyword in agreement_keywords):
-                        print(
-                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}"
-                        )
-                        md_file.write(
-                            f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n"
-                        )
-                        debate_concluded = True
-                    else:
-                        print(
-                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} continues the debate, rejecting the proposal to end. ---{Bcolors.ENDC}"
-                        )
-                        md_file.write(
-                            f"**__{model_config['name']} continues the debate.__**\n\n"
-                        )
-                        self.end_proposed_by = None
+                    self.min_rounds_before_surrender * 2
+                ) and "i conceed" in response.lower():
+                    # Determine winner (the other model)
+                    self.winner = (
+                        "model2" if current_speaker_key == "model1" else "model1"
+                    )
+                    winner_name = self.models[self.winner]["name"]
+                    print(
+                        f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} surrenders! {winner_name} wins the debate! ---{Bcolors.ENDC}"
+                    )
+                    md_file.write(
+                        f"**__{model_config['name']} surrenders. **{winner_name} wins the debate!**__\n\n"
+                    )
+                    debate_concluded = True
 
                 self.print_and_write_response(
                     md_file, turn, model_config, clean_response, exec_time
@@ -997,9 +953,6 @@ class LLMConsensus:
 
                 current_speaker_key = (
                     "model2" if current_speaker_key == "model1" else "model1"
-                )
-                expected_responder = (
-                    "model1" if current_speaker_key == "model2" else "model2"
                 )
 
                 if turn < self.max_rounds * 2 - 1:
@@ -1014,23 +967,32 @@ class LLMConsensus:
         print(
             f"\n{Bcolors.TITLE}{Bcolors.BOLD}{'=' * UI_SUMMARY_WIDTH} Generating Final Summary {'=' * UI_SUMMARY_WIDTH}{Bcolors.ENDC}"
         )
-        summarizer_key = "model1"
+        # Winner writes summary, or model1 if no surrender occurred
+        summarizer_key = self.winner if self.winner else "model1"
         try:
             summary_prompt = self.format_prompt(summarizer_key, is_summary_prompt=True)
             summary_response = self.send_request(
                 summarizer_key, summary_prompt, stop_override=[]
             )
 
-            final_summary_header = f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
+            if self.winner:
+                final_summary_header = f"--- Final Summary (written by {self.models[self.winner]['name']}, the winner!) ---"
+            else:
+                final_summary_header = f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
             print(f"{Bcolors.HEADER}{Bcolors.BOLD}{final_summary_header}{Bcolors.ENDC}")
             print(
                 f"{Bcolors.MODEL1}{textwrap.fill(summary_response, width=UI_TEXT_WIDTH)}{Bcolors.ENDC}"
             )
 
             md_file.write("## Final Summary & Conclusion\n\n")
-            md_file.write(
-                f"_This summary was generated by {self.models[summarizer_key]['name']}_\n\n"
-            )
+            if self.winner:
+                md_file.write(
+                    f"_This summary was generated by {self.models[self.winner]['name']}, the winner of the debate._\n\n"
+                )
+            else:
+                md_file.write(
+                    f"_This summary was generated by {self.models[summarizer_key]['name']}_\n\n"
+                )
             md_file.write(summary_response)
             self.logger.info(
                 f"Final summary generated by {self.models[summarizer_key]['name']}"
