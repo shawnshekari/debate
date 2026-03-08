@@ -4,8 +4,8 @@ __pycache__/
 *$py.class
 *.so
 
-# Debate output files
-*.md
+# Debate output files (exclude README.md)
+debate_*.md
 
 # Environment files
 .env
