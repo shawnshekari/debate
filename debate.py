@@ -57,12 +57,15 @@ class ConfigData(TypedDict, total=False):
 SURRENDER_PHRASE = "[I CONCEED]"
 USER_INPUT_PHRASE = "[USER_INPUT]"
 DEFAULT_MIN_ROUNDS = 3
+DEFAULT_TOPIC = "Let's debate which of us is the 'smarter' AI."
 MAX_TOPIC_LENGTH = 1000
 MAX_USER_INPUT_LENGTH = 5000
 DEFAULT_TIMEOUT_CONNECT = 5
 DEFAULT_TIMEOUT_RESPONSE = 30
 DEFAULT_TIMEOUT_GENERATION = 300
 MAX_ROUNDS = 100
+DEFAULT_MODEL1_URL = "http://localhost:5300/completion"
+DEFAULT_MODEL2_URL = "http://localhost:5301/completion"
 
 # --- UI Constants ---
 UI_TEXT_WIDTH = 100
@@ -119,13 +122,13 @@ class Bcolors:
 class LLMConsensus:
     def __init__(
         self,
-        rounds: int,
-        topic: str,
-        min_rounds: int,
-        model_urls: List[str],
-        model_types: List[Optional[str]],
+        rounds: Optional[int] = None,
+        topic: Optional[str] = None,
+        min_rounds: Optional[int] = None,
+        model_urls: Optional[List[str]] = None,
+        model_types: Optional[List[Optional[str]]] = None,
         config_file: Optional[str] = None,
-        log_level: str = "INFO",
+        log_level: Optional[str] = None,
         log_file: Optional[str] = None,
     ) -> None:
         """Initialize the LLM consensus debate orchestrator.
@@ -140,22 +143,64 @@ class LLMConsensus:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
             log_file: Optional file path for log output.
         """
-        self.logger = setup_logging(log_level, log_file)
+        # Determine log_level with precedence: CLI > Config > Default
+        effective_log_level: str = log_level if log_level is not None else "INFO"
+        self.logger = setup_logging(effective_log_level, log_file)
         self.model_templates: Dict[str, Any] = self.load_model_templates()
         self.models: Dict[str, ModelConfig] = {}
-        self.max_rounds: int = rounds
-        self.initial_topic: str = topic
-        self.min_rounds_before_surrender: int = min_rounds
         self.conversation_history: List[Dict[str, Any]] = []
         self.session: requests.Session = requests.Session()
         self.markdown_filename: str = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
         self.winner: Optional[str] = None
 
+        # Load config first
+        config: Dict[str, Any] = {}
         if config_file:
-            self.load_config(config_file)
+            config = self.load_config(config_file)
 
-        self.validate_inputs(topic, rounds, min_rounds, model_urls, model_types)
-        self.initialize_models(model_urls, model_types)
+        # Apply precedence: CLI > Config > Default
+        self.max_rounds: int = (
+            rounds if rounds is not None else config.get("rounds", 15)
+        )
+        self.initial_topic: str = (
+            topic if topic is not None else config.get("topic", DEFAULT_TOPIC)
+        )
+        self.min_rounds_before_surrender: int = (
+            min_rounds
+            if min_rounds is not None
+            else config.get("min_rounds", DEFAULT_MIN_ROUNDS)
+        )
+
+        # Handle model URLs with precedence
+        if model_urls is not None:
+            self.model_urls: List[str] = model_urls
+        elif "model1_url" in config or "model2_url" in config:
+            self.model_urls = [
+                config.get("model1_url", DEFAULT_MODEL1_URL),
+                config.get("model2_url", DEFAULT_MODEL2_URL),
+            ]
+        else:
+            self.model_urls = [DEFAULT_MODEL1_URL, DEFAULT_MODEL2_URL]
+
+        # Handle model types with precedence
+        if model_types is not None:
+            self.model_types: List[Optional[str]] = model_types
+        elif "model1_type" in config or "model2_type" in config:
+            self.model_types = [
+                config.get("model1_type"),
+                config.get("model2_type"),
+            ]
+        else:
+            self.model_types = [None, None]
+
+        self.validate_inputs(
+            self.initial_topic,
+            self.max_rounds,
+            self.min_rounds_before_surrender,
+            self.model_urls,
+            self.model_types,
+        )
+        self.initialize_models(self.model_urls, self.model_types)
 
     def load_config(self, config_file: str) -> Dict[str, Any]:
         """Load configuration from JSON file."""
@@ -1054,32 +1099,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rounds",
         type=int,
-        default=15,
-        help="Maximum number of rounds for the debate.",
+        default=None,
+        help="Maximum number of rounds for the debate. (Default from config or 15)",
     )
     parser.add_argument(
         "--topic",
         type=str,
-        default="Let's debate which of us is the 'smarter' AI.",
-        help="The initial topic for the debate.",
+        default=None,
+        help="The initial topic for the debate. (Default from config or built-in default)",
     )
     parser.add_argument(
         "--min_rounds",
         type=int,
-        default=DEFAULT_MIN_ROUNDS,
-        help=f"The minimum number of rounds before models can conclude the debate. (Default: {DEFAULT_MIN_ROUNDS})",
+        default=None,
+        help=f"The minimum number of rounds before models can conclude the debate. (Default from config or {DEFAULT_MIN_ROUNDS})",
     )
     parser.add_argument(
         "--model1_url",
         type=str,
-        default="http://localhost:5300/completion",
-        help="URL of the first model's completion endpoint.",
+        default=None,
+        help=f"URL of the first model's completion endpoint. (Default from config or {DEFAULT_MODEL1_URL})",
     )
     parser.add_argument(
         "--model2_url",
         type=str,
-        default="http://localhost:5301/completion",
-        help="URL of the second model's completion endpoint.",
+        default=None,
+        help=f"URL of the second model's completion endpoint. (Default from config or {DEFAULT_MODEL2_URL})",
     )
     parser.add_argument(
         "--model1_type",
@@ -1096,7 +1141,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level (default: INFO).",
     )
@@ -1108,8 +1153,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    model_urls = [args.model1_url, args.model2_url]
-    model_types = [args.model1_type, args.model2_type]
+    # Build model_urls and model_types from individual args or None
+    model_urls: Optional[List[str]] = None
+    if args.model1_url is not None or args.model2_url is not None:
+        model_urls = [
+            args.model1_url if args.model1_url is not None else DEFAULT_MODEL1_URL,
+            args.model2_url if args.model2_url is not None else DEFAULT_MODEL2_URL,
+        ]
+
+    model_types: Optional[List[Optional[str]]] = None
+    if args.model1_type is not None or args.model2_type is not None:
+        model_types = [args.model1_type, args.model2_type]
+
     consensus = LLMConsensus(
         rounds=args.rounds,
         topic=args.topic,
