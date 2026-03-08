@@ -15,8 +15,43 @@ import textwrap
 import re
 import sys
 import os
-from typing import List, Dict, Optional, Any
+import logging
+from typing import List, Dict, Optional, Any, Literal, TypedDict
 from urllib.parse import urlparse
+
+
+class ConversationEntry(TypedDict, total=False):
+    """Type definition for conversation history entries."""
+
+    role: str
+    content: str
+    is_model_response: bool
+    model_key: str
+
+
+class ModelConfig(TypedDict):
+    """Type definition for model configuration."""
+
+    name: str
+    url: str
+    template: str
+    stop_tokens: List[str]
+    color: str
+
+
+class ConfigData(TypedDict, total=False):
+    """Type definition for configuration file data."""
+
+    rounds: int
+    topic: str
+    min_rounds: int
+    model1_url: str
+    model2_url: str
+    model1_type: Optional[str]
+    model2_type: Optional[str]
+    log_level: str
+    log_file: Optional[str]
+
 
 # --- Configuration ---
 CONSENSUS_PHRASE = "[DEBATE_COMPLETE]"
@@ -28,6 +63,48 @@ DEFAULT_TIMEOUT_CONNECT = 5
 DEFAULT_TIMEOUT_RESPONSE = 30
 DEFAULT_TIMEOUT_GENERATION = 300
 MAX_ROUNDS = 100
+
+# --- UI Constants ---
+UI_TEXT_WIDTH = 100
+UI_HEADER_WIDTH = 90
+UI_TITLE_WIDTH = 60
+UI_SUMMARY_WIDTH = 30
+UI_TURN_INDICATOR_WIDTH = 10
+UI_PROGRESS_WIDTH = 40
+
+# --- Logging Configuration ---
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging(
+    log_level: str = "INFO", log_file: Optional[str] = None
+) -> logging.Logger:
+    """Configure logging for the application.
+
+    Args:
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Optional file path for log output
+
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger("llm_consensus")
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+    if not logger.handlers:
+        formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+    return logger
 
 
 class Bcolors:
@@ -48,21 +125,36 @@ class LLMConsensus:
         model_urls: List[str],
         model_types: List[Optional[str]],
         config_file: Optional[str] = None,
-    ):
-        self.model_templates = self.load_model_templates()
-        self.models = {}
-        self.max_rounds = rounds
-        self.initial_topic = topic
-        self.min_rounds_before_consensus = min_rounds
+        log_level: str = "INFO",
+        log_file: Optional[str] = None,
+    ) -> None:
+        """Initialize the LLM consensus debate orchestrator.
+
+        Args:
+            rounds: Maximum number of debate rounds.
+            topic: The debate topic.
+            min_rounds: Minimum rounds before consensus can be proposed.
+            model_urls: List of two model URLs.
+            model_types: Optional model type overrides for each model.
+            config_file: Optional path to configuration file.
+            log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+            log_file: Optional file path for log output.
+        """
+        self.logger = setup_logging(log_level, log_file)
+        self.model_templates: Dict[str, Any] = self.load_model_templates()
+        self.models: Dict[str, ModelConfig] = {}
+        self.max_rounds: int = rounds
+        self.initial_topic: str = topic
+        self.min_rounds_before_consensus: int = min_rounds
         self.conversation_history: List[Dict[str, Any]] = []
-        self.session = requests.Session()
-        self.markdown_filename = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
+        self.session: requests.Session = requests.Session()
+        self.markdown_filename: str = f"debate_{time.strftime('%Y-%m-%d_%H-%M-%S')}.md"
         self.end_proposed_by: Optional[str] = None
 
         if config_file:
             self.load_config(config_file)
 
-        self.validate_inputs(rounds, topic, min_rounds, model_urls, model_types)
+        self.validate_inputs(topic, rounds, min_rounds, model_urls, model_types)
         self.initialize_models(model_urls, model_types)
 
     def load_config(self, config_file: str) -> Dict[str, Any]:
@@ -71,33 +163,64 @@ class LLMConsensus:
             print(
                 f"{Bcolors.MODEL2}Warning: Config file '{config_file}' not found. Using defaults.{Bcolors.ENDC}"
             )
+            self.logger.warning(f"Config file '{config_file}' not found")
             return {}
 
         try:
             with open(config_file, "r") as f:
-                config = json.load(f)
+                config: Dict[str, Any] = json.load(f)
+
+            # Validate configuration
+            validation_errors = self.validate_config(config)
+            if validation_errors:
+                for error in validation_errors:
+                    print(f"{Bcolors.MODEL2}Warning: {error}{Bcolors.ENDC}")
+                    self.logger.warning(error)
+
             print(
                 f"{Bcolors.HEADER}Loaded configuration from {config_file}{Bcolors.ENDC}"
             )
+            self.logger.info(f"Loaded configuration from {config_file}")
             return config
         except json.JSONDecodeError as e:
-            print(
-                f"{Bcolors.MODEL2}Error: Invalid JSON in config file: {e}{Bcolors.ENDC}"
-            )
+            error_msg = f"Invalid JSON in config file: {e}"
+            print(f"{Bcolors.MODEL2}Error: {error_msg}{Bcolors.ENDC}")
+            self.logger.error(error_msg)
             return {}
         except Exception as e:
-            print(f"{Bcolors.MODEL2}Error loading config file: {e}{Bcolors.ENDC}")
+            error_msg = f"Error loading config file: {e}"
+            print(f"{error_msg}", file=sys.stderr)
+            self.logger.error(error_msg)
             return {}
 
     def validate_inputs(
         self,
-        rounds: int,
         topic: str,
+        rounds: int,
         min_rounds: int,
         model_urls: List[str],
         model_types: List[Optional[str]],
     ) -> None:
-        """Validate all input parameters before proceeding."""
+        """Validate all input parameters before proceeding.
+
+        Checks that topic is non-empty and within length limits, rounds are
+        positive and within bounds, and model URLs are valid.
+
+        Args:
+            topic: The debate topic
+            rounds: Maximum number of debate rounds
+            min_rounds: Minimum number of rounds before consensus allowed
+            model_urls: List of two model server URLs
+            model_types: List of optional model type hints
+
+        Raises:
+            ValueError: If any input is invalid
+        """
+        # Sanitize topic to prevent prompt injection
+        topic = self._sanitize_input(topic, max_length=MAX_TOPIC_LENGTH)
+        if not topic:
+            raise ValueError("Topic cannot be empty")
+
         if rounds <= 0:
             raise ValueError(f"Rounds must be positive, got {rounds}")
         if rounds > MAX_ROUNDS:
@@ -121,26 +244,210 @@ class LLMConsensus:
                 raise ValueError(f"Invalid URL for model {i + 1}: {url}")
 
     def validate_url(self, url: str) -> bool:
-        """Validate URL format."""
+        """Validate URL format.
+
+        Checks that the URL has a valid http/https scheme and a network location.
+
+        Args:
+            url: The URL string to validate
+
+        Returns:
+            bool: True if URL is valid, False otherwise
+        """
         try:
             result = urlparse(url)
             return all([result.scheme in ("http", "https"), result.netloc])
         except Exception:
             return False
 
-    def load_model_templates(self) -> Dict:
+    def validate_config(self, config: Dict[str, Any]) -> List[str]:
+        """Validate configuration dictionary.
+
+        Checks that all config values are present with correct types and valid ranges.
+
+        Args:
+            config: Configuration dictionary to validate
+
+        Returns:
+            List[str]: List of validation error messages (empty if valid)
+        """
+        errors: List[str] = []
+
+        # Validate rounds
+        if "rounds" in config:
+            if not isinstance(config["rounds"], int):
+                errors.append(
+                    f"Config 'rounds' must be an integer, got {type(config['rounds']).__name__}"
+                )
+            elif config["rounds"] <= 0:
+                errors.append(
+                    f"Config 'rounds' must be positive, got {config['rounds']}"
+                )
+            elif config["rounds"] > MAX_ROUNDS:
+                errors.append(
+                    f"Config 'rounds' exceeds maximum of {MAX_ROUNDS}, got {config['rounds']}"
+                )
+
+        # Validate min_rounds
+        if "min_rounds" in config:
+            if not isinstance(config["min_rounds"], int):
+                errors.append(
+                    f"Config 'min_rounds' must be an integer, got {type(config['min_rounds']).__name__}"
+                )
+            elif config["min_rounds"] <= 0:
+                errors.append(
+                    f"Config 'min_rounds' must be positive, got {config['min_rounds']}"
+                )
+
+        # Validate rounds vs min_rounds relationship
+        if "rounds" in config and "min_rounds" in config:
+            if isinstance(config["rounds"], int) and isinstance(
+                config["min_rounds"], int
+            ):
+                if config["min_rounds"] > config["rounds"]:
+                    errors.append(
+                        f"Config 'min_rounds' ({config['min_rounds']}) cannot exceed 'rounds' ({config['rounds']})"
+                    )
+
+        # Validate topic
+        if "topic" in config:
+            if not isinstance(config["topic"], str):
+                errors.append(
+                    f"Config 'topic' must be a string, got {type(config['topic']).__name__}"
+                )
+            elif not config["topic"].strip():
+                errors.append("Config 'topic' cannot be empty")
+            elif len(config["topic"]) > MAX_TOPIC_LENGTH:
+                errors.append(
+                    f"Config 'topic' exceeds maximum length of {MAX_TOPIC_LENGTH}"
+                )
+
+        # Validate model URLs
+        for i, key in enumerate(["model1_url", "model2_url"], 1):
+            if key in config:
+                if not isinstance(config[key], str):
+                    errors.append(
+                        f"Config '{key}' must be a string, got {type(config[key]).__name__}"
+                    )
+                elif not self.validate_url(config[key]):
+                    errors.append(
+                        f"Config '{key}' has invalid URL format: {config[key]}"
+                    )
+
+        # Validate model types
+        for i, key in enumerate(["model1_type", "model2_type"], 1):
+            if key in config:
+                if config[key] is not None and not isinstance(config[key], str):
+                    errors.append(
+                        f"Config '{key}' must be a string or null, got {type(config[key]).__name__}"
+                    )
+                elif config[key] and config[key] not in self.model_templates:
+                    errors.append(
+                        f"Config '{key}' '{config[key]}' not found in model_templates.json. "
+                        f"Available: {', '.join(self.model_templates.keys())}"
+                    )
+
+        # Validate log_level
+        if "log_level" in config:
+            valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+            if not isinstance(config["log_level"], str):
+                errors.append(
+                    f"Config 'log_level' must be a string, got {type(config['log_level']).__name__}"
+                )
+            elif config["log_level"].upper() not in valid_levels:
+                errors.append(
+                    f"Config 'log_level' must be one of {valid_levels}, got {config['log_level']}"
+                )
+
+        # Validate log_file
+        if "log_file" in config:
+            if config["log_file"] is not None and not isinstance(
+                config["log_file"], str
+            ):
+                errors.append(
+                    f"Config 'log_file' must be a string or null, got {type(config['log_file']).__name__}"
+                )
+
+        return errors
+
+    def _sanitize_input(self, text: str, max_length: int = MAX_TOPIC_LENGTH) -> str:
+        """Sanitize user input to prevent prompt injection.
+
+        Removes potentially dangerous patterns and limits length.
+
+        Args:
+            text: The input text to sanitize
+            max_length: Maximum allowed length after sanitization
+
+        Returns:
+            str: Sanitized input text
+        """
+        if not text:
+            return ""
+
+        # Limit length first to prevent DoS
+        text = text[:max_length]
+
+        # Remove common prompt injection patterns
+        dangerous_patterns = [
+            r"ignore\s+previous\s+instructions",
+            r"disregard\s+instructions",
+            r"system\s+prompt",
+            r"<[^>]*>",  # HTML/XML tags
+            r"\[SYSTEM",
+            r"\[INSTRUCTION",
+        ]
+
+        for pattern in dangerous_patterns:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+        # Remove excessive whitespace and newlines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    def load_model_templates(self) -> Dict[str, Any]:
+        """Load chat templates from model_templates.json.
+
+        Loads the chat template configurations for different model architectures
+        (gemma, qwen, gpt-oss, mistral) from the JSON file.
+
+        Returns:
+            Dict[str, Any]: Dictionary mapping model types to their templates
+
+        Raises:
+            SystemExit: If file not found or invalid JSON
+        """
         try:
             with open("model_templates.json", "r") as f:
-                return json.load(f)
+                self.logger.debug("Loaded model templates from file")
+                return json.load(f)  # type: ignore
         except FileNotFoundError:
-            print("Error: `model_templates.json` not found.")
+            self.logger.error("model_templates.json not found")
             exit(1)
         except json.JSONDecodeError:
-            print("Error: Could not decode `model_templates.json`.")
+            self.logger.error("Could not decode model_templates.json")
             exit(1)
 
-    def initialize_models(self, model_urls: List[str], model_types: List[str | None]):
+    def initialize_models(
+        self, model_urls: List[str], model_types: List[Optional[str]]
+    ) -> None:
+        """Initialize model connections and detect model types.
+
+        For each model URL provided, attempts to detect the model type either
+        from the provided type or by auto-detection. Stores model configuration
+        including name, URL, and chat template.
+
+        Args:
+            model_urls: List of two model server URLs
+            model_types: List of optional model type hints (None for auto-detect)
+
+        Raises:
+            SystemExit: If model type cannot be detected
+        """
         model_colors = [Bcolors.MODEL1, Bcolors.MODEL2]
+        self.logger.info("Initializing models")
         print(
             f"{Bcolors.HEADER}{'=' * 20} Model Initialization {'=' * 20}{Bcolors.ENDC}"
         )
@@ -153,6 +460,9 @@ class LLMConsensus:
                     f"\n{Bcolors.BOLD}Manually setting model type for: {url}{Bcolors.ENDC}"
                 )
                 print(f"  -> Type specified: '{model_type}'")
+                self.logger.info(
+                    f"Manually setting model {i + 1} type to '{model_type}' for URL: {url}"
+                )
             else:
                 print(
                     f"\n{Bcolors.BOLD}Attempting to auto-identify model at: {url}{Bcolors.ENDC}"
@@ -173,6 +483,9 @@ class LLMConsensus:
                 print(
                     f"  -> {Bcolors.MODEL1}Using template: '{template['template']}'{Bcolors.ENDC}"
                 )
+                self.logger.info(
+                    f"Model {i + 1}: Using template '{template['template']}' (identified as {model_type})"
+                )
             else:
                 self.models[model_key] = {
                     "name": f"Model {i + 1} (Unknown)",
@@ -185,14 +498,19 @@ class LLMConsensus:
                     print(
                         f"  -> {Bcolors.MODEL2}Error: Manual type '{model_type}' not found in model_templates.json.{Bcolors.ENDC}"
                     )
+                    self.logger.warning(
+                        f"Model {i + 1}: Manual type '{model_type}' not found in templates"
+                    )
                 else:
                     print(
                         f"  -> {Bcolors.MODEL2}Could not identify model type.{Bcolors.ENDC}"
                     )
+                    self.logger.warning(f"Model {i + 1}: Could not identify model type")
                 print(f"  -> {Bcolors.MODEL2}Using template: 'default'{Bcolors.ENDC}")
+                self.logger.info(f"Model {i + 1}: Using default template")
         print(f"{Bcolors.HEADER}{'=' * 58}{Bcolors.ENDC}\n")
 
-    def identify_model(self, url: str) -> str | None:
+    def identify_model(self, url: str) -> Optional[str]:
         """
         Identifies the model type by first checking server properties and then
         falling back to a prompt-based guess.
@@ -207,20 +525,27 @@ class LLMConsensus:
                     content = response.json()
                     model_path = content.get("model_path", "").lower()
                     print(f"  -> Server properties found. Model path: {model_path}")
+                    self.logger.debug(f"Server properties: model_path={model_path}")
                     if "gemma" in model_path:
+                        self.logger.debug("Identified as gemma from model_path")
                         return "gemma"
                     if "gpt-oss" in model_path:
+                        self.logger.debug("Identified as gpt-oss from model_path")
                         return "gpt-oss"
                     if "qwen" in model_path or "tongyi" in model_path:
+                        self.logger.debug("Identified as qwen from model_path")
                         return "qwen"
                     if "mistral" in model_path:
+                        self.logger.debug("Identified as mistral from model_path")
                         return "mistral"
             except (requests.exceptions.RequestException, json.JSONDecodeError):
                 print("  -> Server properties endpoint not found or invalid.")
+                self.logger.debug("Server properties endpoint not found or invalid")
                 pass
 
             # Attempt 2: Fallback to prompt-based identification
             print("  -> Falling back to prompt-based identification...")
+            self.logger.debug("Falling back to prompt-based identification")
             test_prompt = "please identify your model architecture and type"
             data = {"prompt": test_prompt, "temperature": 0.1, "n_predict": 128}
             headers = {"Content-Type": "application/json"}
@@ -230,6 +555,7 @@ class LLMConsensus:
             response.raise_for_status()
             content = response.json().get("content", "").lower()
             print(f'  -> Response from prompt: "{content}"')
+            self.logger.debug(f"Model identification response: {content}")
 
             if "gemma" in content:
                 return "gemma"
@@ -240,13 +566,26 @@ class LLMConsensus:
 
             return None
         except requests.exceptions.RequestException as e:
-            print(f"  -> Error connecting to model at {url}: {e}")
+            print(f"  -> Error connecting to model at {url}: {e}", file=sys.stderr)
+            self.logger.error(f"Error connecting to model at {url}: {e}")
             return None
 
     def format_prompt(
         self, target_model_key: str, is_summary_prompt: bool = False
     ) -> str:
-        """Builds a prompt using the correct chat template with refined instructions."""
+        """Build a prompt using the correct chat template.
+
+        Constructs a properly formatted prompt based on the target model's
+        chat template, including system instructions, conversation history,
+        and special handling for summary generation or debate conclusion.
+
+        Args:
+            target_model_key: Key identifying the target model ('model_1' or 'model_2')
+            is_summary_prompt: If True, formats for final summary generation
+
+        Returns:
+            str: Formatted prompt ready to send to the model
+        """
         template_style = self.models[target_model_key]["template"]
         history = self.conversation_history.copy()
 
@@ -282,7 +621,7 @@ class LLMConsensus:
                 )
                 for i, entry in enumerate(history[1:], 1):
                     if entry.get("is_model_response", False):
-                        model_key = entry.get("model_key")
+                        model_key: str = entry.get("model_key")  # type: ignore
                         model_name = self.models[model_key]["name"]
                         prompt += f"<start_of_turn>model\n{model_name}: {entry['content']}<end_of_turn>\n"
                     else:
@@ -291,10 +630,10 @@ class LLMConsensus:
             return prompt
 
         elif template_style == "qwen" or template_style == "gpt-oss":
-            prompt = f"<|im_start|>system\n{system_instruction}<|im_end|>\n"
+            prompt = f"system\n{system_instruction}\n\n"
             for entry in history:
                 if entry.get("is_model_response"):
-                    model_key = entry.get("model_key")
+                    model_key: str = entry.get("model_key")  # type: ignore
                     model_name = self.models[model_key]["name"]
                     prompt += (
                         f"<|im_start|>{model_name}\n{entry['content']}<|im_end|>\n"
@@ -314,7 +653,7 @@ class LLMConsensus:
 
                 for i, entry in enumerate(history[1:], 1):
                     if entry.get("is_model_response", False):
-                        model_key = entry.get("model_key")
+                        model_key: str = entry.get("model_key")  # type: ignore
                         model_name = self.models[model_key]["name"]
                         prompt += f" {model_name}: {entry['content']} </s>"
                     else:
@@ -330,13 +669,33 @@ class LLMConsensus:
         stop_override: Optional[List[str]] = None,
         timeout: int = DEFAULT_TIMEOUT_GENERATION,
     ) -> str:
-        """Send request to model with improved error handling and retry logic."""
+        """Send request to model with retry logic.
+
+        Sends a prompt to the specified model and returns the generated response.
+        Implements retry logic with exponential backoff for transient failures.
+
+        Args:
+            model_key: Key identifying the target model
+            prompt: The prompt to send to the model
+            stop_override: Optional custom stop tokens (overrides model default)
+            timeout: Request timeout in seconds
+
+        Returns:
+            str: Model's generated response
+
+        Raises:
+            SystemExit: If request fails after all retries
+        """
         model_config = self.models[model_key]
         max_retries = 3
         retry_delay = 2
 
+        self.logger.debug(
+            f"Sending request to {model_key} (prompt length: {len(prompt)})"
+        )
+
         for attempt in range(max_retries):
-            response = None
+            response: Optional[requests.Response] = None
             try:
                 stop_tokens = (
                     stop_override
@@ -358,14 +717,20 @@ class LLMConsensus:
                 )
                 response.raise_for_status()
                 result = response.json()
-                content = result.get("content", "").strip()
+                content = str(result.get("content", "")).strip()
                 if not content:
                     raise ValueError("Empty response from model")
+                self.logger.debug(
+                    f"Received response from {model_key} (length: {len(content)})"
+                )
                 return content
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
                     print(
                         f"{Bcolors.MODEL2}Timeout for {model_key}, retrying in {retry_delay}s...{Bcolors.ENDC}"
+                    )
+                    self.logger.warning(
+                        f"Timeout for {model_key}, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})"
                     )
                     time.sleep(retry_delay)
                     retry_delay *= 2
@@ -373,11 +738,17 @@ class LLMConsensus:
                     print(
                         f"{Bcolors.MODEL2}Timeout after {max_retries} attempts for {model_key}{Bcolors.ENDC}"
                     )
+                    self.logger.error(
+                        f"Timeout after {max_retries} attempts for {model_key}"
+                    )
                     return f"Error: Request timeout for {model_config['name']}"
             except requests.exceptions.ConnectionError:
                 if attempt < max_retries - 1:
                     print(
                         f"{Bcolors.MODEL2}Connection error for {model_key}, retrying in {retry_delay}s...{Bcolors.ENDC}"
+                    )
+                    self.logger.warning(
+                        f"Connection error for {model_key}, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})"
                     )
                     time.sleep(retry_delay)
                     retry_delay *= 2
@@ -385,35 +756,62 @@ class LLMConsensus:
                     print(
                         f"{Bcolors.MODEL2}Connection failed after {max_retries} attempts for {model_key}{Bcolors.ENDC}"
                     )
+                    self.logger.error(
+                        f"Connection failed after {max_retries} attempts for {model_key}"
+                    )
                     return f"Error: Could not connect to {model_config['name']}"
             except requests.exceptions.HTTPError as e:
                 status_code = (
                     response.status_code if response is not None else "unknown"
                 )
+                self.logger.error(
+                    f"HTTP {status_code} for {model_config['name']}: {str(e)}"
+                )
                 return f"Error: HTTP {status_code} for {model_config['name']}: {str(e)}"
             except json.JSONDecodeError:
+                self.logger.error(f"Invalid JSON response from {model_config['name']}")
                 return f"Error: Invalid JSON response from {model_config['name']}"
             except ValueError as e:
+                self.logger.error(f"Value error from {model_config['name']}: {str(e)}")
                 return f"Error: {str(e)}"
             except Exception as e:
+                self.logger.error(
+                    f"Unexpected error with {model_config['name']}: {str(e)}"
+                )
                 return f"Error: Unexpected error with {model_config['name']}: {str(e)}"
 
         return f"Error: Failed to get response from {model_config['name']}"
 
     def print_and_write_response(
-        self, md_file, turn: int, model_config: Dict, response: str, exec_time: float
-    ):
-        """Helper to print to shell and write to markdown file."""
+        self,
+        md_file: Any,
+        turn: int,
+        model_config: ModelConfig,
+        response: str,
+        exec_time: float,
+    ) -> None:
+        """Print response to shell and write to markdown file.
+
+        Formats the model's response for colored terminal display and
+        appends it to the markdown transcript file with timing info.
+
+        Args:
+            md_file: Open file handle for the markdown transcript
+            turn: Current turn number (0-indexed)
+            model_config: Configuration dict for the responding model
+            response: The model's response text
+            exec_time: Time taken to generate response in seconds
+        """
         # Print to shell
         header_text = f" Turn {turn + 1}: {model_config['name']}'s Response "
         print(
-            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 10}{header_text}{'=' * (90 - len(header_text))}{Bcolors.ENDC}"
+            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * UI_TURN_INDICATOR_WIDTH}{header_text}{'=' * (UI_HEADER_WIDTH - len(header_text))}{Bcolors.ENDC}"
         )
         print(
-            f"{model_config['color']}{textwrap.fill(response, width=100)}{Bcolors.ENDC}"
+            f"{model_config['color']}{textwrap.fill(response, width=UI_TEXT_WIDTH)}{Bcolors.ENDC}"
         )
         print(
-            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * 90} [Response Time: {exec_time:.2f}s]{Bcolors.ENDC}\n"
+            f"{Bcolors.HEADER}{Bcolors.BOLD}{'=' * UI_HEADER_WIDTH} [Response Time: {exec_time:.2f}s]{Bcolors.ENDC}\n"
         )
         # Write to file
         md_file.write(f"## Turn {turn + 1}: {model_config['name']}\n\n")
@@ -421,10 +819,39 @@ class LLMConsensus:
             md_file.write(f"> {line}\n")
         md_file.write(f"\n_Response Time: {exec_time:.2f}s_\n\n---\n\n")
 
+    def show_progress(self, turn: int, max_turns: int) -> None:
+        """Display progress indicator for the debate.
+
+        Shows current turn, round, and a progress bar.
+
+        Args:
+            turn: Current turn number (0-indexed)
+            max_turns: Maximum number of turns (max_rounds * 2)
+        """
+        current_round = (turn // 2) + 1
+        max_rounds = max_turns // 2
+        progress = (turn + 1) / max_turns
+        filled = int(UI_PROGRESS_WIDTH * progress)
+        bar = "█" * filled + "░" * (UI_PROGRESS_WIDTH - filled)
+        percent = progress * 100
+
+        progress_line = (
+            f"{Bcolors.TITLE}{Bcolors.BOLD}"
+            f"[Round {current_round}/{max_rounds}] "
+            f"[{bar}] {percent:.1f}% "
+            f"(Turn {turn + 1}/{max_turns})"
+            f"{Bcolors.ENDC}"
+        )
+        print(progress_line)
+        self.logger.debug(
+            f"Progress: Round {current_round}/{max_rounds}, Turn {turn + 1}/{max_turns}"
+        )
+
     def conduct_discussion(self) -> None:
         """Conducts a turn-by-turn discussion with refined consensus logic."""
+        self.logger.info(f"Starting debate with topic: {self.initial_topic[:50]}...")
         print(
-            f"{Bcolors.TITLE}{Bcolors.BOLD}{'=' * 60}\n      STARTING LLM CONSENSUS DISCUSSION (V3.7 - Refined Consensus)\n{'=' * 60}{Bcolors.ENDC}"
+            f"{Bcolors.TITLE}{Bcolors.BOLD}{'=' * UI_TITLE_WIDTH}\n      STARTING LLM CONSENSUS DISCUSSION (V3.7 - Refined Consensus)\n{'=' * UI_TITLE_WIDTH}{Bcolors.ENDC}"
         )
         print(
             f"{Bcolors.TITLE}Saving transcript to: {self.markdown_filename}{Bcolors.ENDC}"
@@ -440,10 +867,20 @@ class LLMConsensus:
                 {"role": "user", "content": self.initial_topic}
             )
             current_speaker_key = "model1"
+            expected_responder: str | None = (
+                "model2"  # Track who should respond next for consensus validation
+            )
+
+            self.logger.info(
+                f"Debate starting: max_rounds={self.max_rounds}, min_rounds={self.min_rounds_before_consensus}"
+            )
 
             for turn in range(self.max_rounds * 2):
                 model_config = self.models[current_speaker_key]
                 prompt = self.format_prompt(current_speaker_key)
+
+                if turn == 0:
+                    self.show_progress(turn, self.max_rounds * 2)
 
                 start_time = time.time()
                 response = self.send_request(current_speaker_key, prompt)
@@ -484,6 +921,9 @@ class LLMConsensus:
                     current_speaker_key = (
                         "model2" if current_speaker_key == "model1" else "model1"
                     )
+                    expected_responder = (
+                        "model1" if current_speaker_key == "model2" else "model2"
+                    )
                     continue
 
                 # Check if consensus phrase is used AND we are past the minimum number of rounds
@@ -498,7 +938,10 @@ class LLMConsensus:
                         md_file.write(
                             f"**__{model_config['name']} has proposed concluding the debate.__**\n\n"
                         )
-                    else:  # Consensus has been confirmed by the other model
+                    elif (
+                        self.end_proposed_by != current_speaker_key
+                        and current_speaker_key == expected_responder
+                    ):
                         print(
                             f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} agrees. Both models have concluded the debate. ---{Bcolors.ENDC}"
                         )
@@ -506,9 +949,20 @@ class LLMConsensus:
                             f"**__{model_config['name']} agrees. The debate has concluded by consensus.__**\n\n"
                         )
                         debate_concluded = True
+                    else:
+                        print(
+                            f"\n{Bcolors.TITLE}{Bcolors.BOLD}--- {model_config['name']} reaffirms proposal to conclude. Awaiting confirmation... ---{Bcolors.ENDC}"
+                        )
+                        md_file.write(
+                            f"**__{model_config['name']} reaffirms proposal to conclude.__**\n\n"
+                        )
 
                 # If a conclusion was proposed but the current model did not agree
-                elif self.end_proposed_by:
+                elif (
+                    self.end_proposed_by
+                    and self.end_proposed_by != current_speaker_key
+                    and current_speaker_key == expected_responder
+                ):
                     response_lower = response.lower()
                     agreement_keywords = [
                         "agree",
@@ -544,35 +998,58 @@ class LLMConsensus:
                 current_speaker_key = (
                     "model2" if current_speaker_key == "model1" else "model1"
                 )
+                expected_responder = (
+                    "model1" if current_speaker_key == "model2" else "model2"
+                )
 
+                if turn < self.max_rounds * 2 - 1:
+                    self.show_progress(turn + 1, self.max_rounds * 2)
+
+            self.logger.info("Generating final summary")
             self.generate_final_summary(md_file)
 
-    def generate_final_summary(self, md_file):
+    def generate_final_summary(self, md_file: Any) -> None:
         """Tasks a model to write a final summary of the debate."""
+        self.logger.info("Starting final summary generation")
         print(
-            f"\n{Bcolors.TITLE}{Bcolors.BOLD}{'=' * 30} Generating Final Summary {'=' * 30}{Bcolors.ENDC}"
+            f"\n{Bcolors.TITLE}{Bcolors.BOLD}{'=' * UI_SUMMARY_WIDTH} Generating Final Summary {'=' * UI_SUMMARY_WIDTH}{Bcolors.ENDC}"
         )
         summarizer_key = "model1"
-        summary_prompt = self.format_prompt(summarizer_key, is_summary_prompt=True)
-        summary_response = self.send_request(
-            summarizer_key, summary_prompt, stop_override=[]
-        )
+        try:
+            summary_prompt = self.format_prompt(summarizer_key, is_summary_prompt=True)
+            summary_response = self.send_request(
+                summarizer_key, summary_prompt, stop_override=[]
+            )
 
-        final_summary_header = (
-            f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
-        )
-        print(f"{Bcolors.HEADER}{Bcolors.BOLD}{final_summary_header}{Bcolors.ENDC}")
-        print(
-            f"{Bcolors.MODEL1}{textwrap.fill(summary_response, width=100)}{Bcolors.ENDC}"
-        )
+            final_summary_header = f"--- Final Summary (written by {self.models[summarizer_key]['name']}) ---"
+            print(f"{Bcolors.HEADER}{Bcolors.BOLD}{final_summary_header}{Bcolors.ENDC}")
+            print(
+                f"{Bcolors.MODEL1}{textwrap.fill(summary_response, width=UI_TEXT_WIDTH)}{Bcolors.ENDC}"
+            )
 
-        md_file.write("## Final Summary & Conclusion\n\n")
-        md_file.write(
-            f"_This summary was generated by {self.models[summarizer_key]['name']}._\n\n"
-        )
-        md_file.write(summary_response)
+            md_file.write("## Final Summary & Conclusion\n\n")
+            md_file.write(
+                f"_This summary was generated by {self.models[summarizer_key]['name']}_\n\n"
+            )
+            md_file.write(summary_response)
+            self.logger.info(
+                f"Final summary generated by {self.models[summarizer_key]['name']}"
+            )
+        except Exception as e:
+            print(
+                f"{Bcolors.TITLE}Warning: Could not generate summary: {e}{Bcolors.ENDC}",
+                file=sys.stderr,
+            )
+            self.logger.error(f"Failed to generate summary: {e}")
+            md_file.write("\n## Final Summary & Conclusion\n\n")
+            md_file.write("*Summary generation failed due to an error.*\n\n")
 
-    def run(self):
+    def close(self) -> None:
+        """Close the requests session and cleanup resources."""
+        if hasattr(self, "session"):
+            self.session.close()
+
+    def run(self) -> None:
         """Main execution method, fully restored."""
         try:
             self.conduct_discussion()
@@ -582,6 +1059,9 @@ class LLMConsensus:
             print(
                 f"{Bcolors.TITLE}Full transcript saved to {self.markdown_filename}{Bcolors.ENDC}"
             )
+            self.logger.info(
+                f"Debate completed successfully. Transcript saved to {self.markdown_filename}"
+            )
         except KeyboardInterrupt:
             print(
                 f"\n\n{Bcolors.TITLE}{Bcolors.BOLD}--- Script interrupted by user ---{Bcolors.ENDC}"
@@ -589,8 +1069,14 @@ class LLMConsensus:
             print(
                 f"{Bcolors.TITLE}Partial transcript saved to {self.markdown_filename}{Bcolors.ENDC}"
             )
+            self.logger.warning(
+                f"Debate interrupted by user. Partial transcript saved to {self.markdown_filename}"
+            )
         except Exception as e:
             print(f"\n{Bcolors.BOLD}An unexpected error occurred: {e}{Bcolors.ENDC}")
+            self.logger.exception(f"Unexpected error during debate: {e}")
+        finally:
+            self.close()
 
 
 if __name__ == "__main__":
@@ -645,6 +1131,19 @@ if __name__ == "__main__":
         default=None,
         help="Manually specify the type of the second model (e.g., 'gemma', 'qwen').",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level (default: INFO).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file (optional). If not specified, logs to stderr only.",
+    )
     args = parser.parse_args()
 
     model_urls = [args.model1_url, args.model2_url]
@@ -656,5 +1155,7 @@ if __name__ == "__main__":
         model_urls=model_urls,
         model_types=model_types,
         config_file=args.config,
+        log_level=args.log_level,
+        log_file=args.log_file,
     )
     consensus.run()
