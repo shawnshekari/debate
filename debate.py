@@ -1078,7 +1078,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model2_url",
         type=str,
-        default="http://192.168.2.55:5300/completion",
+        default="http://localhost:5301/completion",
         help="URL of the second model's completion endpoint.",
     )
     parser.add_argument(
